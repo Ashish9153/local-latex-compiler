@@ -1,0 +1,13 @@
+# One-click deploy on Render: https://render.com/deploy?repo=https://github.com/Ashish9153/local-latex-compiler
+services:
+  - type: web
+    name: latex-compiler
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    autoDeploy: true            # redeploys automatically on every push to GitHub
+    envVars:
+      - key: APP_PASSWORD       # optional: set a password so strangers can't use your server
+        sync: false
+      - key: MAX_PARALLEL_COMPILES
+        value: "1"              # the free plan has a small CPU/RAM allowance
