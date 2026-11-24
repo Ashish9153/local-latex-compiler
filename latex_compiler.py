@@ -20,7 +20,9 @@ Usage:
 
 Environment variables (hosting):
     PORT                    port to listen on (set automatically by Render / HF)
-    APP_PASSWORD            if set, the site asks for this password (any username)
+    APP_PASSWORD            password for the site (any username); REQUIRED when hosted
+    ALLOW_NO_PASSWORD=1     run a public server without a password (not recommended)
+    ALLOW_LUALATEX=1        allow LuaLaTeX even without per-compile isolation
     COMPILE_TIMEOUT         seconds per compile (default 600)
     MAX_UPLOAD_MB           max project size per request (default 60)
     MAX_PARALLEL_COMPILES   simultaneous compiles (default 2)
@@ -52,7 +54,9 @@ BIN_DIR = APP_DIR / "bin"
 PROJECTS_DIR = HOME / "LatexProjects"
 BUILD = "_build"
 COMPILE_TIMEOUT = int(os.environ.get("COMPILE_TIMEOUT", "600"))  # seconds
-HOSTED = False  # set True when served to the internet (see main())
+HOSTED = False   # set True when served to the internet (see main())
+SANDBOX = False  # set True when the server runs as root: each compile then runs as its own uid
+SCRIPT = os.path.abspath(__file__)
 
 TEXT_EXT = {".tex", ".bib", ".cls", ".sty", ".bst", ".txt", ".md", ".cfg", ".def",
             ".clo", ".bbx", ".cbx", ".lbx", ".dtx", ".ins", ".csv", ".dat", ".tikz",
@@ -100,6 +104,12 @@ def available_engines():
         p = exe(name)
         if p:
             found[name] = p
+    # Lua code inside a document can read any file the compiler can read. On a public server
+    # that is only acceptable when every compile runs as its own throw-away user (SANDBOX).
+    if HOSTED and not SANDBOX and os.environ.get("ALLOW_LUALATEX") != "1":
+        found.pop("lualatex", None)
+    if HOSTED:
+        found.pop("tectonic", None)  # downloads packages at compile time; not used on servers
     return found
 
 
@@ -149,6 +159,45 @@ def install_tectonic(log=print):
     return str(dest)
 
 
+# --------------------------------------------------------------------------- biber guard
+
+def biber_guard(args):
+    """Run biber only if every bibliography source in the .bcf is a plain file inside the project.
+    biber does not honour TeX's file-access restrictions, so without this a document could make it
+    read any file on the server (\\addbibresource{/some/path}, globs or remote URLs)."""
+    indir = None
+    for i, a in enumerate(args):
+        if a == "--input-directory" and i + 1 < len(args):
+            indir = args[i + 1]
+    bcf = None
+    for a in reversed([a for a in args if not a.startswith("-")]):
+        for cand in (a, a + ".bcf", os.path.join(indir or "", a), os.path.join(indir or "", a + ".bcf")):
+            if cand.endswith(".bcf") and os.path.isfile(cand):
+                bcf = cand
+                break
+        if bcf:
+            break
+    if not bcf:
+        print("biber-guard: no .bcf file found", file=sys.stderr)
+        return 2
+    xml = open(bcf, encoding="utf-8", errors="replace").read()
+    for attrs, src in re.findall(r"<bcf:datasource([^>]*)>([^<]*)</bcf:datasource>", xml):
+        src = src.strip()
+        bad = (re.search(r'location="remote"', attrs) or re.search(r'glob="(true|1)"', attrs)
+               or src.startswith(("/", "\\", "~")) or re.match(r"^[A-Za-z]:", src) or "://" in src
+               or ".." in re.split(r"[\\/]", src) or any(c in src for c in "*?[]{}"))
+        if bad:
+            print(f"biber-guard: refused bibliography source '{src}' - only .bib files inside "
+                  f"the project are allowed (no absolute paths, '..', globs or URLs).", file=sys.stderr)
+            print(f"ERROR - biber-guard refused '{src}'")
+            return 2
+    biber = exe("biber")
+    if not biber:
+        print("biber is not installed", file=sys.stderr)
+        return 2
+    return subprocess.call([biber, "--noconf"] + args)
+
+
 # --------------------------------------------------------------------------- compiling
 
 def needs_unicode_engine(src):
@@ -158,7 +207,7 @@ def needs_unicode_engine(src):
 SECRET_ENV = ("APP_PASSWORD", "HF_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 
 
-def run(cmd, cwd, timeout, extra_env=None):
+def _run(cmd, cwd, timeout, extra_env=None, run_as=None):
     env = {k: v for k, v in os.environ.items() if k not in SECRET_ENV}
     env.update(extra_env or {})
     env.setdefault("max_print_line", "10000")  # keep log lines unwrapped (TeX Live)
@@ -167,6 +216,10 @@ def run(cmd, cwd, timeout, extra_env=None):
         env["openout_any"] = "p"
         env["shell_escape"] = "f"  # never run shell commands from a document
     kw = {"start_new_session": True} if os.name != "nt" else {}
+    if run_as is not None:  # isolated job user: cannot read other jobs or the server's secrets
+        kw.update(user=run_as["uid"], group=run_as["uid"], extra_groups=[], umask=0o077)
+        env["HOME"] = run_as["home"]
+        env["TEXMFVAR"] = os.path.join(run_as["home"], ".texmf-var")
     try:
         p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, env=env, **kw)
@@ -187,7 +240,7 @@ def run(cmd, cwd, timeout, extra_env=None):
         return -999, out.decode("utf-8", "replace") + f"\n\n*** Compilation stopped after {int(timeout)}s (timeout). ***\n"
 
 
-def compile_project(root: Path, main: str, engine: str = "auto", timeout=COMPILE_TIMEOUT):
+def compile_project(root: Path, main: str, engine: str = "auto", timeout=COMPILE_TIMEOUT, run_as=None):
     """Compile root/main. Returns dict with pdf path (or None), log text, issues."""
     t0 = time.time()
     main_path = (root / main).resolve()
@@ -198,6 +251,8 @@ def compile_project(root: Path, main: str, engine: str = "auto", timeout=COMPILE
     stem = main_path.stem
     outdir = root / BUILD
     outdir.mkdir(exist_ok=True)
+    if run_as is not None:
+        os.chown(outdir, run_as["uid"], run_as["uid"])
     src = main_path.read_text("utf-8", "replace")
     engines = available_engines()
     unicode_doc = needs_unicode_engine(src)
@@ -226,6 +281,13 @@ def compile_project(root: Path, main: str, engine: str = "auto", timeout=COMPILE
         except OSError:
             pass
 
+    def run(cmd, cwd, timeout, extra_env=None):  # noqa: F811  (bind the job user)
+        return _run(cmd, cwd, timeout, extra_env, run_as)
+
+    if engine not in ("auto",) and engine not in engines:
+        return {"ok": False, "pdf": None, "issues": [], "engine": engine, "seconds": 0,
+                "log": f"Engine '{engine}' is not available here."}
+
     log_parts = []
     cwd = str(rel_dir)
     out_abs = str(outdir.resolve())
@@ -242,8 +304,11 @@ def compile_project(root: Path, main: str, engine: str = "auto", timeout=COMPILE
     elif engine == "latexmk":
         mode = {"xelatex": "-xelatex", "lualatex": "-lualatex"}.get(
             "xelatex" if unicode_doc else "pdf", "-pdf")
-        cmd = [engines["latexmk"], mode, "-f", "-interaction=nonstopmode", "-file-line-error",
-               "-synctex=1", f"-outdir={out_abs}", main_path.name]
+        # -norc: never execute latexmkrc files (they are Perl code) from the project.
+        # biber goes through our guard, which refuses bibliography paths outside the project.
+        guard = f'$biber = q{{"{sys.executable}" "{SCRIPT}" --biber-guard %O %S}};'
+        cmd = [engines["latexmk"], "-norc", "-e", guard, mode, "-f", "-interaction=nonstopmode",
+               "-file-line-error", "-synctex=1", f"-outdir={out_abs}", main_path.name]
         code, out = run(cmd, cwd, deadline())
         log_parts.append(out)
     else:
@@ -258,8 +323,9 @@ def compile_project(root: Path, main: str, engine: str = "auto", timeout=COMPILE
         bcf = outdir / (stem + ".bcf")
         ran_bib = False
         if bcf.exists() and exe("biber"):
-            c2, o2 = run([exe("biber"), "--input-directory", out_abs, "--output-directory", out_abs,
-                          stem], cwd, deadline(), {"BIBINPUTS": str(rel_dir) + os.pathsep})
+            c2, o2 = run([sys.executable, SCRIPT, "--biber-guard", "--input-directory", out_abs,
+                          "--output-directory", out_abs, stem], cwd, deadline(),
+                         {"BIBINPUTS": str(rel_dir) + os.pathsep})
             log_parts.append(o2); ran_bib = True
         elif aux.exists() and exe("bibtex") and re.search(r"\\(citation|bibdata)", aux.read_text("utf-8", "replace")):
             sep = os.pathsep
@@ -345,12 +411,60 @@ def parse_issues(log, default_file):
 # Spaces, ...) where the server's disk is wiped on every restart.
 
 import base64
+import hashlib
 import hmac
 import tempfile
 
 MAX_BODY = int(os.environ.get("MAX_UPLOAD_MB", "60")) * 1024 * 1024
-JOBS = threading.BoundedSemaphore(int(os.environ.get("MAX_PARALLEL_COMPILES", "2")))
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+MAX_JOBS = int(os.environ.get("MAX_PARALLEL_COMPILES", "2"))
+JOBS = threading.BoundedSemaphore(MAX_JOBS)
+PASSWORD_HASH = ""  # sha256 of APP_PASSWORD; the plain password is removed from the environment
+STATIC_DIR = Path(SCRIPT).parent / "static"
+STATIC = {  # served from our own server: no third-party CDN sees your visits or can inject code
+    "codemirror.js": "application/javascript", "codemirror.css": "text/css",
+    "material-darker.css": "text/css", "stex.js": "application/javascript",
+    "pdf.min.js": "application/javascript", "pdf.worker.min.js": "application/javascript",
+}
+CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+       "img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:; "
+       "connect-src 'self'; frame-src 'self' blob:; object-src 'none'; base-uri 'none'; "
+       "form-action 'none'; frame-ancestors 'none'")
+
+# --- brute-force protection: too many wrong passwords from one address -> locked for a while
+FAILS = {}            # ip -> [count, first_failure_time]
+FAILS_LOCK = threading.Lock()
+MAX_FAILS, FAIL_WINDOW = 10, 15 * 60
+GLOBAL_FAILS = []     # timestamps of all recent failures (backstop if addresses are spoofed)
+
+# --- per-job users (only when the server runs as root, e.g. on Render / Docker)
+UID_POOL = list(range(61000, 61000 + max(MAX_JOBS, 1) * 2))
+UID_LOCK = threading.Lock()
+
+
+def take_uid():
+    with UID_LOCK:
+        return UID_POOL.pop()
+
+
+def release_uid(uid):
+    # kill anything the job may have left running, then return the uid to the pool
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                with open(f"/proc/{pid}/status") as f:
+                    if re.search(rf"^Uid:\s+{uid}\s", f.read(), re.M):
+                        os.kill(int(pid), 9)
+            except (OSError, ValueError):
+                pass
+    with UID_LOCK:
+        UID_POOL.append(uid)
+
+
+def chown_tree(root, uid):
+    os.chown(root, uid, uid)
+    for dp, dns, fns in os.walk(root):
+        for n in dns + fns:
+            os.lchown(os.path.join(dp, n), uid, uid)
 
 
 def clean_rel(path):
@@ -380,6 +494,9 @@ def unzip_project(data):
                  and not n.split("/")[-1].startswith(".")]
         tops = {n.split("/")[0] for n in names}
         strip = len(tops) == 1 and all("/" in n for n in names)  # Overleaf-style single top folder
+        infos = {i.filename: i for i in z.infolist()}
+        if sum(infos[n].file_size for n in names) > MAX_BODY * 3:
+            raise ValueError("zip is too large when unpacked")
         total = 0
         for n in names:
             rel = clean_rel(n.split("/", 1)[1] if strip else n)
@@ -423,6 +540,11 @@ class Handler(BaseHTTPRequestHandler):
         if HOSTED:
             sys.stderr.write("%s %s\n" % (self.command, self.path.split("?")[0]))
 
+    def client_ip(self):
+        # the right-most entry is added by the hosting provider's proxy and can't be faked
+        fwd = self.headers.get("X-Forwarded-For", "")
+        return (fwd.split(",")[-1].strip() if fwd else "") or self.client_address[0]
+
     def send(self, code, body, ctype="application/json", extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body).encode()
@@ -431,26 +553,70 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        if "Cache-Control" not in (extra or {}):
+            self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        if code >= 400:  # request body may be unread: don't reuse this connection
+            self.send_header("Connection", "close")
+            self.close_connection = True
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
     def authorized(self):
-        if not APP_PASSWORD:
+        # Local mode: only answer requests addressed to localhost (blocks DNS-rebinding attacks)
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        if not HOSTED and host not in ("127.0.0.1", "localhost", "::1"):
+            self.send(403, "Forbidden", "text/plain")
+            return False
+        # Block other websites from sending requests through your browser (CSRF)
+        origin = self.headers.get("Origin")
+        if self.command == "POST" and origin and urllib.parse.urlparse(origin).netloc != self.headers.get("Host"):
+            self.send(403, "Cross-site request refused", "text/plain")
+            return False
+        if not HOSTED:
             return True
+        if not PASSWORD_HASH:
+            if os.environ.get("ALLOW_NO_PASSWORD") == "1":
+                return True
+            self.send(503, NO_PASSWORD_PAGE, "text/html; charset=utf-8")
+            return False
+        ip = self.client_ip()
+        with FAILS_LOCK:
+            n, t = FAILS.get(ip, (0, 0))
+            if n >= MAX_FAILS and time.time() - t < FAIL_WINDOW:
+                locked = True
+            else:
+                locked = False
+                if time.time() - t >= FAIL_WINDOW:
+                    FAILS.pop(ip, None)
+        if locked:
+            self.send(429, "Too many wrong passwords. Try again in 15 minutes.", "text/plain")
+            return False
         h = self.headers.get("Authorization", "")
         if h.startswith("Basic "):
             try:
                 pw = base64.b64decode(h[6:]).decode("utf-8", "replace").split(":", 1)[-1]
-                if hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
+                if hmac.compare_digest(hashlib.sha256(pw.encode()).hexdigest(), PASSWORD_HASH):
+                    with FAILS_LOCK:
+                        FAILS.pop(ip, None)
                     return True
             except ValueError:
                 pass
+            now = time.time()
+            with FAILS_LOCK:
+                n, t = FAILS.get(ip, (0, now))
+                FAILS[ip] = (n + 1, t)
+                GLOBAL_FAILS[:] = [x for x in GLOBAL_FAILS if now - x < FAIL_WINDOW] + [now]
+                many = len(GLOBAL_FAILS) > 30
+            time.sleep(5 if many else 1)  # slow down guessing (much slower under attack)
         self.send(401, "Password required", "text/plain",
-                  {"WWW-Authenticate": 'Basic realm="LaTeX Compiler (any username)"'})
+                  {"WWW-Authenticate": 'Basic realm="LaTeX Compiler (any username)", charset="UTF-8"'})
         return False
 
     def body(self):
@@ -460,15 +626,21 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(n) if n else b""
 
     def do_GET(self):
-        if not self.authorized():
-            return
         path = urllib.parse.urlparse(self.path).path
-        if path == "/":
-            return self.send(200, PAGE, "text/html; charset=utf-8")
         if path == "/healthz":
             return self.send(200, "ok", "text/plain")
+        if not self.authorized():
+            return
+        if path == "/":
+            return self.send(200, PAGE, "text/html; charset=utf-8")
+        if path.startswith("/static/") and path[8:] in STATIC:
+            f = STATIC_DIR / path[8:]
+            if f.exists():
+                return self.send(200, f.read_bytes(), STATIC[path[8:]],
+                                 {"Cache-Control": "public, max-age=86400"})
         if path == "/api/status":
             return self.send(200, {"engines": list(available_engines()), "hosted": HOSTED,
+                                   "isolated": SANDBOX,
                                    "install": INSTALL_STATE, "timeout": COMPILE_TIMEOUT,
                                    "max_mb": MAX_BODY // 1048576})
         self.send(404, "not found", "text/plain")
@@ -486,8 +658,17 @@ class Handler(BaseHTTPRequestHandler):
                 with JOBS, tempfile.TemporaryDirectory(prefix="tex-") as tmp:
                     root = Path(tmp)
                     write_files(root, files)
-                    res = compile_project(root, main, d.get("engine", "auto"))
-                    pdf = Path(res["pdf"]).read_bytes() if res["pdf"] else None
+                    run_as = None
+                    if SANDBOX:
+                        uid = take_uid()
+                        chown_tree(tmp, uid)
+                        run_as = {"uid": uid, "home": tmp}
+                    try:
+                        res = compile_project(root, main, d.get("engine", "auto"), run_as=run_as)
+                        pdf = Path(res["pdf"]).read_bytes() if res["pdf"] else None
+                    finally:
+                        if run_as:
+                            release_uid(run_as["uid"])
                 res["pdf"] = base64.b64encode(pdf).decode() if pdf else None
                 res["log"] = res["log"].replace(tmp, ".")
                 res.pop("raw_output", None)
@@ -517,16 +698,24 @@ class Handler(BaseHTTPRequestHandler):
 
 # --------------------------------------------------------------------------- web page
 
+NO_PASSWORD_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Set a password</title><body style="font:16px/1.5 system-ui;max-width:560px;margin:40px auto;padding:0 16px;background:#16181d;color:#e4e6eb">
+<h2>Almost there: set a password</h2>
+<p>This LaTeX compiler is on the public internet, so it refuses to run without a password.</p>
+<ol><li>Open your hosting dashboard (Render: <b>Environment</b> tab; Hugging Face: Space <b>Settings &rarr; Variables and secrets</b>).</li>
+<li>Add a secret named <code>APP_PASSWORD</code> with a long password (16+ characters).</li>
+<li>Save. The app restarts and will ask for that password (any username works).</li></ol></body>"""
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>LaTeX Compiler</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%233fb37f'/><text x='16' y='22' font-size='15' font-family='serif' font-weight='bold' text-anchor='middle' fill='%2306140d'>TeX</text></svg>">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/stex/stex.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<link rel="stylesheet" href="/static/codemirror.css">
+<link rel="stylesheet" href="/static/material-darker.css">
+<script src="/static/codemirror.js"></script>
+<script src="/static/stex.js"></script>
+<script src="/static/pdf.min.js"></script>
 <style>
 :root{--bg:#16181d;--panel:#1e2128;--line:#2c3039;--fg:#e4e6eb;--mute:#9aa0ab;--acc:#3fb37f;--err:#ef5b5b;--warn:#e7b340;--box:#7a8cff}
 *{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif}
@@ -738,8 +927,8 @@ async function showPdf(b64s){const bin=atob(b64s),u=new Uint8Array(bin.length);f
   S.pdf=new Blob([u],{type:'application/pdf'});await renderPdf()}
 async function renderPdf(){if(!S.pdf)return;const v=$('#view'),keep=v.scrollTop/(v.scrollHeight||1);
   if(!window.pdfjsLib){const url=URL.createObjectURL(S.pdf);v.innerHTML=`<iframe src="${url}#view=FitH"></iframe>`;return}
-  pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-  const doc=await pdfjsLib.getDocument({data:new Uint8Array(await S.pdf.arrayBuffer())}).promise;
+  pdfjsLib.GlobalWorkerOptions.workerSrc='/static/pdf.worker.min.js';
+  const doc=await pdfjsLib.getDocument({data:new Uint8Array(await S.pdf.arrayBuffer()),isEvalSupported:false}).promise;
   const frag=document.createDocumentFragment(),dpr=window.devicePixelRatio||1,width=v.clientWidth-24;
   for(let n=1;n<=doc.numPages;n++){const pg=await doc.getPage(n),vp1=pg.getViewport({scale:1});
     const sc=S.scale||Math.max(.3,width/vp1.width),vp=pg.getViewport({scale:sc*dpr}),c=document.createElement('canvas');
@@ -802,7 +991,9 @@ async function status(){try{const s=await(await fetch('/api/status')).json();con
 # --------------------------------------------------------------------------- main
 
 def main():
-    global HOSTED
+    global HOSTED, SANDBOX, PASSWORD_HASH
+    if len(sys.argv) > 1 and sys.argv[1] == "--biber-guard":
+        sys.exit(biber_guard(sys.argv[2:]))
     ap = argparse.ArgumentParser(description="Free LaTeX compiler with a browser editor")
     ap.add_argument("--host", default=None, help="interface to listen on (0.0.0.0 = public)")
     ap.add_argument("--port", type=int, default=None)
@@ -810,6 +1001,7 @@ def main():
     ap.add_argument("--install-tectonic", action="store_true")
     ap.add_argument("--cli", metavar="FILE.tex", help="compile a file in the terminal (no UI)")
     ap.add_argument("--engine", default="auto")
+    ap.add_argument("--pw-fd", type=int, help=argparse.SUPPRESS)
     a = ap.parse_args()
 
     if a.install_tectonic:
@@ -837,6 +1029,24 @@ def main():
     host = a.host or ("0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
     HOSTED = host not in ("127.0.0.1", "localhost", "::1")
 
+    # Keep the password out of this process's environment (readable via /proc): hand only its
+    # hash to a fresh copy of ourselves through a pipe, with APP_PASSWORD removed from the env.
+    if a.pw_fd is not None:
+        with os.fdopen(a.pw_fd, "rb") as f:
+            PASSWORD_HASH = f.read().decode().strip()
+    elif os.environ.get("APP_PASSWORD"):
+        PASSWORD_HASH = hashlib.sha256(os.environ["APP_PASSWORD"].encode()).hexdigest()
+        if len(os.environ["APP_PASSWORD"]) < 12:
+            print("  WARNING: APP_PASSWORD is short - use 16+ random characters.", flush=True)
+        if os.name != "nt":
+            r, w = os.pipe()
+            os.write(w, PASSWORD_HASH.encode())
+            os.close(w)
+            os.set_inheritable(r, True)
+            env = {k: v for k, v in os.environ.items() if k != "APP_PASSWORD"}
+            os.execve(sys.executable, [sys.executable, SCRIPT] + sys.argv[1:] + ["--pw-fd", str(r)], env)
+    SANDBOX = HOSTED and os.name != "nt" and os.geteuid() == 0
+
     if not HOSTED and not available_engines():
         print("No LaTeX engine was found on this computer.")
         try:
@@ -854,7 +1064,9 @@ def main():
     url = f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}/"
     print(f"\n  LaTeX Compiler running on {host}:{port}  ({'public server' if HOSTED else url})")
     print(f"  Engines: {', '.join(available_engines()) or 'none'}")
-    print(f"  Password protection: {'ON' if APP_PASSWORD else 'off'}", flush=True)
+    print(f"  Password protection: {'ON' if PASSWORD_HASH else ('OFF' if not HOSTED else 'NOT SET - site is locked until APP_PASSWORD is set')}")
+    if HOSTED:
+        print(f"  Per-compile isolation: {'ON (each compile runs as its own user)' if SANDBOX else 'off (not running as root)'}", flush=True)
     if not HOSTED and not a.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:

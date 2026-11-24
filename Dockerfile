@@ -16,11 +16,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         texlive-xetex texlive-luatex lmodern fonts-lmodern cm-super \
     && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/texlive/texmf-dist/doc
 
-# Run as an unprivileged user (uid 1000, required by Hugging Face Spaces)
+# The web server runs as root ONLY so that it can run every compile as its own throw-away
+# user (uid 61000+): compiles then cannot read each other's files or the server's secrets.
+# (If a host forces a non-root user, the app still works, just without per-compile isolation.)
 RUN (userdel -r ubuntu 2>/dev/null || true) && useradd -m -u 1000 app
-USER app
-WORKDIR /home/app
-COPY --chown=app latex_compiler.py .
+WORKDIR /app
+COPY latex_compiler.py ./
+COPY static ./static
+RUN chmod -R a+rX /app
 
 # Warm up font caches so the first real compile is fast
 RUN mkdir /tmp/w && cd /tmp/w \
@@ -28,7 +31,7 @@ RUN mkdir /tmp/w && cd /tmp/w \
  && printf '\\documentclass{article}\\usepackage{fontspec}\\begin{document}Hi\\end{document}\n' > b.tex \
  && pdflatex -interaction=nonstopmode a.tex >/dev/null \
  && (lualatex -interaction=nonstopmode b.tex >/dev/null || true) \
- && cd / && rm -rf /tmp/w
+ && cd / && rm -rf /tmp/w && chmod -R a+rX /var/lib/texmf
 
 EXPOSE 7860
 HEALTHCHECK --interval=60s --timeout=5s CMD python3 -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ['PORT']+'/healthz')" || exit 1

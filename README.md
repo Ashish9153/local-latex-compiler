@@ -9,7 +9,7 @@ from this GitHub repo and use it on any device (phone, tablet, laptop) **without
 - BibTeX & **biblatex/biber**, TikZ, beamer, IEEE/ACM/Springer/Elsevier classes, XeLaTeX/LuaLaTeX (`fontspec`).
 - **Projects are saved in your browser.** The server stores nothing. Use *Download project (.zip)* as a backup.
 - Works on phones (Files / Editor / PDF tabs).
-- Optional password so only you can use your server.
+- Password-protected when hosted, with brute-force lockout. Each compile runs isolated (see *Privacy & security*).
 
 ---
 
@@ -18,7 +18,7 @@ from this GitHub repo and use it on any device (phone, tablet, laptop) **without
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Ashish9153/local-latex-compiler)
 
 1. Click the button above and sign in to Render **with GitHub** (free, no card needed).
-2. When it asks for `APP_PASSWORD`, type a password. Anyone visiting the site will need it (any username works).
+2. When it asks for `APP_PASSWORD`, type a **long password (16+ characters)**. It's required: the site stays locked until it's set. Any username works.
 3. Click **Deploy**. The first build takes about 5–10 minutes because it installs TeX Live.
 4. Open the `https://latex-compiler-xxxx.onrender.com` link it gives you, then bookmark it or add it to your phone's home screen.
 
@@ -37,7 +37,8 @@ It also has a small CPU, so big documents compile slower. If that bothers you, u
    - **Variables** tab → *New repository variable*: name `HF_SPACE`, value = `your-hf-username/latex-compiler`.
 5. Open the **Actions** tab → *Sync to Hugging Face Space* → **Run workflow**.
    After this, every push to GitHub updates the Space automatically.
-6. Optional: in the Space's **Settings → Variables and secrets**, add a secret `APP_PASSWORD`.
+6. **Required:** in the Space's **Settings → Variables and secrets**, add a *secret* `APP_PASSWORD` (16+ characters).
+   Also consider making the Space **Private**, which adds Hugging Face's own login on top.
 
 Your app will be at `https://huggingface.co/spaces/your-hf-username/latex-compiler`.
 Spaces also sleep after about 48 h without visitors and wake up when you open them.
@@ -65,7 +66,9 @@ Or use Docker:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `APP_PASSWORD` | *(none)* | Ask visitors for this password |
+| `APP_PASSWORD` | *(required when hosted)* | Password for the site (any username) |
+| `ALLOW_NO_PASSWORD` | *(off)* | Set to `1` to run a public server without a password (not recommended) |
+| `ALLOW_LUALATEX` | *(off)* | Allow LuaLaTeX even when compiles can't be isolated (see below) |
 | `COMPILE_TIMEOUT` | `600` | Max seconds per compile |
 | `MAX_UPLOAD_MB` | `60` | Max project size |
 | `MAX_PARALLEL_COMPILES` | `2` | Compiles running at the same time |
@@ -73,5 +76,34 @@ Or use Docker:
 **Missing a package?** Add the matching Ubuntu `texlive-*` package to the `apt-get install` line in
 `Dockerfile` (for example `texlive-lang-cyrillic`, `texlive-lang-chinese`, `texlive-fonts-extra`) and push.
 
-**Security:** documents can't run shell commands (`\write18` is disabled) or read files outside
-their own project. Each compile runs in a temporary folder that is deleted afterwards.
+## Privacy & security
+
+**What protects your research**
+- **No documents are stored on the server.** Each compile uses a temporary folder that is deleted
+  right after the PDF is sent back. The server logs record only "GET /" or "POST /api/compile", never content.
+- **Password**: required on hosted servers. Only a hash is kept in memory, and the plain password is
+  removed from the process environment. 10 wrong tries from one address lock that address out for 15 minutes.
+- **HTTPS**: Render and Hugging Face serve the site over HTTPS, so documents are encrypted in transit.
+- **Each compile runs as its own throw-away system user** (when the container runs as root, which is
+  the default in this Dockerfile). Compiles can't read each other's files or the server's secrets.
+- **Documents can't escape their project**: no shell commands (`\write18`), no `latexmkrc` code, no
+  reading files outside the project, and bibliography paths are checked before biber runs.
+- **No third-party scripts**: the editor and PDF viewer are served by your own server, and a strict
+  Content-Security-Policy stops the page from sending data anywhere else.
+
+**What you should know**
+- **Your hosting company can technically see what runs on its servers** (Render or Hugging Face
+  staff, under their privacy policies). For unpublished, NDA or patent-sensitive work, run it on
+  **your own computer** (Option D). Nothing then leaves your machine.
+- **Projects live in your browser**, unencrypted, like any website data. Anyone using your browser
+  profile can open them. On a shared or public computer use a private/incognito window
+  (everything is wiped when it closes), or delete the project when done.
+- **This GitHub repository is public.** That's fine for the code, but **never commit your
+  thesis/paper files to it**. You can make the repo private under *Settings → General → Danger Zone*;
+  Render and the Hugging Face sync still work.
+- **Share the password with nobody**, and use a long random one.
+- **If your host forces a non-root user**, the app prints `Per-compile isolation: off` in its logs.
+  It's still safe for a single person, but XeLaTeX could then embed images from another compile running
+  at the same moment, and LuaLaTeX is disabled. This only matters if several people share your server.
+- **PDF metadata**: your PDF can contain the author/title (from `\author`, `hyperref`), the creation
+  date, and file names of included figures. Check *File → Properties* before sending a PDF out.
